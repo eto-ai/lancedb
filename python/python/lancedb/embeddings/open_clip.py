@@ -126,6 +126,10 @@ class OpenClipEmbeddings(EmbeddingFunction):
         """
         Issue concurrent requests to retrieve the image data
         """
+        return [
+            self.generate_image_embedding(image) for image in tqdm(images)
+        ]
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [
                 executor.submit(self.generate_image_embedding, image)

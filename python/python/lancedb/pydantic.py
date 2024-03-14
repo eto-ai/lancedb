@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import inspect
+import io
 import sys
 import types
 from abc import ABC, abstractmethod
@@ -26,7 +27,9 @@ from typing import (
     Callable,
     Dict,
     Generator,
+    Iterable,
     List,
+    Tuple,
     Type,
     Union,
     _GenericAlias,
@@ -36,18 +39,29 @@ import numpy as np
 import pyarrow as pa
 import pydantic
 import semver
+from lance.arrow import (
+    EncodedImageType,
+)
+from lance.util import _check_huggingface
+from pydantic.fields import FieldInfo
+from pydantic_core import core_schema
+
+from .util import attempt_import_or_raise
 
 PYDANTIC_VERSION = semver.Version.parse(pydantic.__version__)
-try:
-    from pydantic_core import CoreSchema, core_schema
-except ImportError:
-    if PYDANTIC_VERSION >= (2,):
-        raise
 
 if TYPE_CHECKING:
     from pydantic.fields import FieldInfo
 
     from .embeddings import EmbeddingFunctionConfig
+
+    try:
+        from pydantic import GetJsonSchemaHandler
+        from pydantic.json_schema import JsonSchemaValue
+        from pydantic_core import CoreSchema
+    except ImportError:
+        if PYDANTIC_VERSION >= (2,):
+            raise
 
 
 class FixedSizeListMixin(ABC):
@@ -123,7 +137,7 @@ def Vector(
         @classmethod
         def __get_pydantic_core_schema__(
             cls, _source_type: Any, _handler: pydantic.GetCoreSchemaHandler
-        ) -> CoreSchema:
+        ) -> "CoreSchema":
             return core_schema.no_info_after_validator_function(
                 cls,
                 core_schema.list_schema(
@@ -181,25 +195,118 @@ def _py_type_to_arrow_type(py_type: Type[Any], field: FieldInfo) -> pa.DataType:
     elif getattr(py_type, "__origin__", None) in (list, tuple):
         child = py_type.__args__[0]
         return pa.list_(_py_type_to_arrow_type(child, field))
+    elif _safe_is_huggingface_image():
+        import datasets
+        
     raise TypeError(
         f"Converting Pydantic type to Arrow Type: unsupported type {py_type}."
     )
 
 
+class ImageMixin(ABC):
+    @staticmethod
+    @abstractmethod
+    def value_arrow_type() -> pa.DataType:
+        raise NotImplementedError
+
+
+def EncodedImage():
+    attempt_import_or_raise("PIL", "pillow or pip install lancedb[embeddings]")
+    import PIL.Image
+
+    class EncodedImage(bytes, ImageMixin):
+        """Pydantic type for inlined images.
+
+        !!! warning
+            Experimental feature.
+
+        Examples
+        --------
+
+        >>> import pydantic
+        >>> from lancedb.pydantic import EncodedImage
+        ...
+        >>> class MyModel(pydantic.BaseModel):
+        ...     image: EncodedImage()
+        >>> schema = pydantic_to_schema(MyModel)
+        >>> assert schema == pa.schema([
+        ...     pa.field("image", pa.binary(), False)
+        ... ])
+        """
+
+        def __repr__(self):
+            return "EncodedImage()"
+
+        @staticmethod
+        def value_arrow_type() -> pa.DataType:
+            return EncodedImageType()
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, _source_type: Any, _handler: pydantic.GetCoreSchemaHandler
+        ) -> "CoreSchema":
+            from_bytes_schema = core_schema.bytes_schema()
+
+            return core_schema.json_or_python_schema(
+                json_schema=from_bytes_schema,
+                python_schema=core_schema.union_schema(
+                    [
+                        core_schema.is_instance_schema(PIL.Image.Image),
+                        from_bytes_schema,
+                    ]
+                ),
+                serialization=core_schema.plain_serializer_function_ser_schema(
+                    lambda instance: cls.validate(instance)
+                ),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, _core_schema: "CoreSchema", handler: "GetJsonSchemaHandler"
+        ) -> "JsonSchemaValue":
+            return handler(core_schema.bytes_schema())
+
+        @classmethod
+        def __get_validators__(cls) -> Generator[Callable, None, None]:
+            yield cls.validate
+
+        # For pydantic v2
+        @classmethod
+        def validate(cls, v):
+            if isinstance(v, bytes):
+                return v
+            if isinstance(v, PIL.Image.Image):
+                with io.BytesIO() as output:
+                    v.save(output, format=v.format)
+                    return output.getvalue()
+            raise TypeError(
+                "EncodedImage can take bytes or PIL.Image.Image "
+                f"as input but got {type(v)}"
+            )
+
+        if PYDANTIC_VERSION < (2, 0):
+
+            @classmethod
+            def __modify_schema__(cls, field_schema: Dict[str, Any]):
+                field_schema["type"] = "string"
+                field_schema["format"] = "binary"
+
+    return EncodedImage
+
+
 if PYDANTIC_VERSION.major < 2:
-
-    def _pydantic_model_to_fields(model: pydantic.BaseModel) -> List[pa.Field]:
-        return [
-            _pydantic_to_field(name, field) for name, field in model.__fields__.items()
-        ]
-
+    def _safe_get_fields(model: pydantic.BaseModel):
+        return model.__fields__
 else:
+    def _safe_get_fields(model: pydantic.BaseModel):    
+        return model.model_fields
 
-    def _pydantic_model_to_fields(model: pydantic.BaseModel) -> List[pa.Field]:
-        return [
-            _pydantic_to_field(name, field)
-            for name, field in model.model_fields.items()
-        ]
+
+def _pydantic_model_to_fields(model: pydantic.BaseModel) -> List[pa.Field]:
+    return [
+        _pydantic_to_field(name, field)
+        for name, field in _safe_get_fields(model).items()
+    ]
 
 
 def _pydantic_to_arrow_type(field: FieldInfo) -> pa.DataType:
@@ -230,6 +337,9 @@ def _pydantic_to_arrow_type(field: FieldInfo) -> pa.DataType:
             return pa.struct(fields)
         elif issubclass(field.annotation, FixedSizeListMixin):
             return pa.list_(field.annotation.value_arrow_type(), field.annotation.dim())
+        elif issubclass(field.annotation, ImageMixin):
+            return field.annotation.value_arrow_type()
+
     return _py_type_to_arrow_type(field.annotation, field)
 
 
@@ -335,13 +445,7 @@ class LanceModel(pydantic.BaseModel):
         """
         Get the field names of this model.
         """
-        return list(cls.safe_get_fields().keys())
-
-    @classmethod
-    def safe_get_fields(cls):
-        if PYDANTIC_VERSION.major < 2:
-            return cls.__fields__
-        return cls.model_fields
+        return list(_safe_get_fields(cls).keys())
 
     @classmethod
     def parse_embedding_functions(cls) -> List["EmbeddingFunctionConfig"]:
@@ -351,14 +455,16 @@ class LanceModel(pydantic.BaseModel):
         from .embeddings import EmbeddingFunctionConfig
 
         vec_and_function = []
-        for name, field_info in cls.safe_get_fields().items():
-            func = get_extras(field_info, "vector_column_for")
+        def get_vector_column(name, field_info):
+            fun = get_extras(field_info, "vector_column_for")
             if func is not None:
                 vec_and_function.append([name, func])
+        visit_fields(_safe_get_fields(cls).items(), get_vector_column)
 
         configs = []
+        # find the source columns for each one
         for vec, func in vec_and_function:
-            for source, field_info in cls.safe_get_fields().items():
+            def get_source_column(source, field_info):
                 src_func = get_extras(field_info, "source_column_for")
                 if src_func is func:
                     # note we can't use == here since the function is a pydantic
@@ -371,19 +477,47 @@ class LanceModel(pydantic.BaseModel):
                             source_column=source, vector_column=vec, function=func
                         )
                     )
+            visit_fields(_safe_get_fields(cls).items(), get_source_column)
         return configs
+    
+
+def visit_fields(fields: Iterable[Tuple[str, FieldInfo]], 
+                 visitor: Callable[[str, FieldInfo], Any]):
+    """
+    Visit all the leaf fields in a Pydantic model.
+
+    Parameters
+    ----------
+    fields : Iterable[Tuple(str, FieldInfo)]
+        The fields to visit.
+    visitor : Callable[[str, FieldInfo], Any]
+        The visitor function.
+    """
+    for name, field_info in fields:
+        # if the field is a pydantic model then
+        # visit all subfields
+        if (isinstance(getattr(field_info, "annotation"), type) 
+            and issubclass(field_info.annotation, pydantic.BaseModel)):
+            visit_fields(_safe_get_fields(field_info.annotation).items(), 
+                           _add_prefix(visitor, name))
+        else:
+            visitor(name, field_info)
 
 
-def get_extras(field_info: FieldInfo, key: str) -> Any:
-    """
-    Get the extra metadata from a Pydantic FieldInfo.
-    """
-    if PYDANTIC_VERSION.major >= 2:
-        return (field_info.json_schema_extra or {}).get(key)
-    return (field_info.field_info.extra or {}).get("json_schema_extra", {}).get(key)
+def _add_prefix(visitor: Callable[[str, FieldInfo], Any], prefix: str) -> Callable[[str, FieldInfo], Any]:
+    def prefixed_visitor(name: str, field: FieldInfo):
+        return visitor(f"{prefix}.{name}", field)
+    return prefixed_visitor
 
 
 if PYDANTIC_VERSION.major < 2:
+
+    def get_extras(field_info: FieldInfo, key: str) -> Any:
+        """
+        Get the extra metadata from a Pydantic FieldInfo.
+        """
+        return (field_info.field_info.extra or {}).get("json_schema_extra", {}).get(key)
+
 
     def model_to_dict(model: pydantic.BaseModel) -> Dict[str, Any]:
         """
@@ -392,6 +526,13 @@ if PYDANTIC_VERSION.major < 2:
         return model.dict()
 
 else:
+
+    def get_extras(field_info: FieldInfo, key: str) -> Any:
+        """
+        Get the extra metadata from a Pydantic FieldInfo.
+        """
+        return (field_info.json_schema_extra or {}).get(key)
+    
 
     def model_to_dict(model: pydantic.BaseModel) -> Dict[str, Any]:
         """

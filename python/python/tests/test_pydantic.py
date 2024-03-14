@@ -12,16 +12,26 @@
 #  limitations under the License.
 
 
+import io
 import json
+import os
 import sys
 from datetime import date, datetime
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pyarrow as pa
 import pydantic
 import pytest
-from lancedb.pydantic import PYDANTIC_VERSION, LanceModel, Vector, pydantic_to_schema
 from pydantic import Field
+
+from lancedb.pydantic import (
+    PYDANTIC_VERSION,
+    EncodedImage,
+    LanceModel,
+    Vector,
+    pydantic_to_schema,
+)
 
 
 @pytest.mark.skipif(
@@ -243,3 +253,23 @@ def test_lance_model():
 
     t = TestModel()
     assert t == TestModel(vec=[0.0] * 16, li=[1, 2, 3])
+
+
+def test_schema_with_images():
+    pytest.importorskip("PIL")
+    import PIL.Image
+
+    class TestModel(LanceModel):
+        img: EncodedImage()
+
+    img_path = Path(os.path.dirname(__file__)) / "images/1.png"
+    with open(img_path, "rb") as f:
+        img_bytes = f.read()
+
+    m1 = TestModel(img=PIL.Image.open(img_path))
+    m2 = TestModel(img=img_bytes)
+
+    def tobytes(m):
+        return PIL.Image.open(io.BytesIO(m.model_dump()["img"])).tobytes()
+
+    assert tobytes(m1) == tobytes(m2)

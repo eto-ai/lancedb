@@ -12,6 +12,8 @@
 #  limitations under the License.
 
 import functools
+import io
+import os
 from copy import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -20,19 +22,21 @@ from typing import List
 from unittest.mock import PropertyMock, patch
 
 import lance
-import lancedb
 import numpy as np
 import pandas as pd
 import polars as pl
 import pyarrow as pa
 import pytest
 import pytest_asyncio
+from lance.arrow import EncodedImageType
+from pydantic import BaseModel
+
+import lancedb
 from lancedb.conftest import MockTextEmbeddingFunction
 from lancedb.db import AsyncConnection, LanceDBConnection
 from lancedb.embeddings import EmbeddingFunctionConfig, EmbeddingFunctionRegistry
-from lancedb.pydantic import LanceModel, Vector
+from lancedb.pydantic import EncodedImage, LanceModel, Vector
 from lancedb.table import LanceTable
-from pydantic import BaseModel
 
 
 class MockDB:
@@ -108,6 +112,7 @@ def test_create_table(db):
             pa.field("vector", pa.list_(pa.float32(), 2)),
             pa.field("item", pa.string()),
             pa.field("price", pa.float32()),
+            pa.field("encoded_image", EncodedImageType()),
         ]
     )
     expected = pa.Table.from_arrays(
@@ -115,13 +120,26 @@ def test_create_table(db):
             pa.FixedSizeListArray.from_arrays(pa.array([3.1, 4.1, 5.9, 26.5]), 2),
             pa.array(["foo", "bar"]),
             pa.array([10.0, 20.0]),
+            pa.ExtensionArray.from_storage(
+                EncodedImageType(), pa.array([b"foo", b"bar"], pa.binary())
+            ),
         ],
         schema=schema,
     )
     data = [
         [
-            {"vector": [3.1, 4.1], "item": "foo", "price": 10.0},
-            {"vector": [5.9, 26.5], "item": "bar", "price": 20.0},
+            {
+                "vector": [3.1, 4.1],
+                "item": "foo",
+                "price": 10.0,
+                "encoded_image": b"foo",
+            },
+            {
+                "vector": [5.9, 26.5],
+                "item": "bar",
+                "price": 20.0,
+                "encoded_image": b"bar",
+            },
         ]
     ]
     df = pd.DataFrame(data[0])
@@ -1025,3 +1043,22 @@ async def test_time_travel(db_async: AsyncConnection):
     # Can't use restore if not checked out
     with pytest.raises(ValueError, match="checkout before running restore"):
         await table.restore()
+
+        
+def test_add_image(tmp_path):
+    pytest.importorskip("PIL")
+    import PIL.Image
+
+    db = lancedb.connect(tmp_path)
+
+    class TestModel(LanceModel):
+        img: EncodedImage()
+
+    img_path = Path(os.path.dirname(__file__)) / "images/1.png"
+    m1 = TestModel(img=PIL.Image.open(img_path))
+
+    def tobytes(m):
+        return PIL.Image.open(io.BytesIO(m.model_dump()["img"])).tobytes()
+
+    table = LanceTable.create(db, "my_table", schema=TestModel)
+    table.add([m1])
