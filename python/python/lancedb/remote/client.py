@@ -55,11 +55,13 @@ class RestfulLanceDBClient:
     region: str
     api_key: Credential
     host_override: Optional[str] = attrs.field(default=None)
+    db_prefix: Optional[str] = attrs.field(default=None)
 
     closed: bool = attrs.field(default=False, init=False)
 
     connection_timeout: float = attrs.field(default=120.0, kw_only=True)
     read_timeout: float = attrs.field(default=300.0, kw_only=True)
+    storage_options: Optional[Dict[str, str]] = attrs.field(default=None, kw_only=True)
 
     @functools.cached_property
     def session(self) -> requests.Session:
@@ -92,6 +94,18 @@ class RestfulLanceDBClient:
             headers["Host"] = f"{self.db_name}.{self.region}.api.lancedb.com"
         if self.host_override:
             headers["x-lancedb-database"] = self.db_name
+        if self.storage_options:
+            if self.storage_options.get("account_name") is not None:
+                headers["x-azure-storage-account-name"] = self.storage_options[
+                    "account_name"
+                ]
+            if self.storage_options.get("azure_storage_account_name") is not None:
+                headers["x-azure-storage-account-name"] = self.storage_options[
+                    "azure_storage_account_name"
+                ]
+        if self.db_prefix:
+            headers["x-lancedb-database-prefix"] = self.db_prefix
+
         return headers
 
     @staticmethod
