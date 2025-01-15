@@ -1,24 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
+from typing import List, Union
 import unittest.mock as mock
 from datetime import timedelta
 from pathlib import Path
 
 import lancedb
+from lancedb.db import AsyncConnection
+from lancedb.embeddings.base import TextEmbeddingFunction
+from lancedb.embeddings.registry import get_registry, register
 from lancedb.index import IvfPq, FTS
+from lancedb.rerankers.cross_encoder import CrossEncoderReranker
 import numpy as np
 import pandas.testing as tm
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 import pytest_asyncio
 from lancedb.pydantic import LanceModel, Vector
 from lancedb.query import (
+    AsyncFTSQuery,
+    AsyncHybridQuery,
+    AsyncQuery,
     AsyncQueryBase,
+    AsyncVectorQuery,
     LanceVectorQueryBuilder,
     Query,
 )
 from lancedb.table import AsyncTable, LanceTable
+from tests.utils import exception_output
 
 
 @pytest.fixture(scope="module")
@@ -509,15 +520,22 @@ async def test_query_async(table_async: AsyncTable):
         expected_columns=["id", "vector", "_rowid"],
     )
 
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+async def test_query_reranked_async(table_async: AsyncTable):
     # FTS with rerank
     await table_async.create_index("text", config=FTS(with_position=False))
     await check_query(
-        table_async.query().nearest_to_text("dog").rerank(),
+        table_async.query().nearest_to_text("dog").rerank(CrossEncoderReranker()),
         expected_num_rows=1,
     )
 
     # Vector query with rerank
-    await check_query(table_async.vector_search([1, 2]).rerank(), expected_num_rows=2)
+    await check_query(
+        table_async.vector_search([1, 2]).rerank(CrossEncoderReranker()),
+        expected_num_rows=2,
+    )
 
 
 @pytest.mark.asyncio
@@ -574,18 +592,20 @@ async def test_none_query(table_async: AsyncTable):
 
 
 @pytest.mark.asyncio
-async def test_fast_search_async(tmp_path):
-    db = await lancedb.connect_async(tmp_path)
-    vectors = pa.FixedShapeTensorArray.from_numpy_ndarray(
-        np.random.rand(256, 32)
-    ).storage
-    table = await db.create_table("test", pa.table({"vector": vectors}))
+async def test_fast_search_async(mem_db_async: AsyncConnection):
+    # vectors = pa.FixedShapeTensorArray.from_numpy_ndarray(
+    #     np.random.rand(256, 32)
+    # ).storage
+    vectors = pa.FixedSizeListArray.from_arrays(
+        pc.random(256 * 16).cast(pa.float32()), 16
+    )
+    table = await mem_db_async.create_table("test", pa.table({"vector": vectors}))
     await table.create_index(
         "vector", config=IvfPq(num_partitions=1, num_sub_vectors=1)
     )
     await table.add(pa.table({"vector": vectors}))
 
-    q = [1.0] * 32
+    q = [1.0] * 16
     plan = await table.query().nearest_to(q).explain_plan(True)
     assert "LanceScan" in plan
     plan = await table.query().nearest_to(q).fast_search().explain_plan(True)
@@ -635,3 +655,199 @@ async def test_query_with_f16(tmp_path: Path):
     tbl = await db.create_table("test", df)
     results = await tbl.vector_search([np.float16(1), np.float16(2)]).to_pandas()
     assert len(results) == 2
+
+
+@pytest.mark.asyncio
+async def test_awaitable_query():
+    data = pa.table(
+        {
+            "vector": pa.array(
+                [[1, 2], [3, 4]], type=pa.list_(pa.float32(), list_size=2)
+            ),
+            "text": ["hello", "world"],
+            "id": [1, 2],
+        }
+    )
+    db = await lancedb.connect_async("memory://")
+    table = await db.create_table("test", data)
+    await table.create_index("text", config=FTS())
+
+    # We can pass awaitable vector query
+    async def eventual_vec_query():
+        return (0.0, 0.1)
+
+    q = table.query().nearest_to(eventual_vec_query())
+    q = await q._resolve()
+    assert isinstance(q, AsyncVectorQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1, 2]
+    assert "_distance" in results.column_names
+
+    # If awaitable vector query returns None, VectorQuery -> Query
+    async def eventual_query_none():
+        return None
+
+    q = table.query().nearest_to(eventual_query_none())
+    assert isinstance(q, AsyncVectorQuery)
+    q = await q._resolve()
+    assert isinstance(q, AsyncQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1, 2]
+    assert "_distance" not in results.column_names
+
+    # We can pass awaitable fts query
+    async def eventual_fts_query():
+        return "hello"
+
+    q = table.query().nearest_to_text(eventual_fts_query())
+    assert isinstance(q, AsyncFTSQuery)
+    q = await q._resolve()
+    assert isinstance(q, AsyncFTSQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1]
+
+    # If awaitable fts query returns None, FTSQuery -> Query
+    q = table.query().nearest_to_text(eventual_query_none())
+    assert isinstance(q, AsyncFTSQuery)
+    q = await q._resolve()
+    assert isinstance(q, AsyncQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1, 2]
+
+    # We can pass awaitable hybrid query
+    q = (
+        table.query()
+        .nearest_to(eventual_vec_query())
+        .nearest_to_text(eventual_fts_query())
+    )
+    assert isinstance(q, AsyncHybridQuery)
+    q = await q._resolve()
+    assert isinstance(q, AsyncHybridQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1, 2]
+
+    # If awaitable FTS query returns None, HybridQuery -> VectorQuery
+    q = (
+        table.query()
+        .nearest_to(eventual_vec_query())
+        .nearest_to_text(eventual_query_none())
+    )
+    assert isinstance(q, AsyncHybridQuery)
+    q = await q._resolve()
+    assert isinstance(q, AsyncVectorQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1, 2]
+    assert "_distance" in results.column_names
+
+    # If awaitable Vector query returns None, HybridQuery -> FTSQuery
+    q = (
+        table.query()
+        .nearest_to(eventual_query_none())
+        .nearest_to_text(eventual_fts_query())
+    )
+    assert isinstance(q, AsyncHybridQuery)
+    q = await q._resolve()
+    assert isinstance(q, AsyncFTSQuery)
+    results = await q.to_arrow()
+    assert results["id"].to_pylist() == [1]
+
+    # If both awaitables return None, raise exception
+    q = (
+        table.query()
+        .nearest_to(eventual_query_none())
+        .nearest_to_text(eventual_query_none())
+    )
+    assert isinstance(q, AsyncHybridQuery)
+    with pytest.raises(ValueError):
+        await q._resolve()
+
+
+@pytest.mark.asyncio
+async def test_query_search_auto(mem_db_async: AsyncConnection):
+    nrows = 1000
+    data = pa.table({"text": [str(i) for i in range(nrows)]})
+
+    @register("test")
+    class TestEmbedding(TextEmbeddingFunction):
+        def ndims(self):
+            return 4
+
+        def generate_embeddings(
+            self, texts: Union[List[str], np.ndarray]
+        ) -> List[np.array]:
+            embeddings = []
+            for text in texts:
+                vec = np.array([float(text) / 1000] * self.ndims())
+                embeddings.append(vec)
+            return embeddings
+
+    registry = get_registry()
+    func = registry.get("test").create()
+
+    class TestModel(LanceModel):
+        text: str = func.SourceField()
+        vector: Vector(func.ndims()) = func.VectorField()
+
+    tbl = await mem_db_async.create_table("test", data, schema=TestModel)
+
+    funcs = await tbl.embedding_functions()
+    assert len(funcs) == 1
+
+    # No FTS or vector index
+    # Search for vector -> vector query
+    q = [0.1] * 4
+    query = await tbl.search(q)._resolve()
+    assert isinstance(query, AsyncVectorQuery)
+
+    # Without an FTS index, just embed and do vector search
+    query = await tbl.search("0.1")._resolve()
+    assert isinstance(query, AsyncVectorQuery)
+
+    # If we add an FTS index, we do hybrid search
+    await tbl.create_index("text", config=FTS())
+    query = await tbl.search("0.1")._resolve()
+    assert isinstance(query, AsyncHybridQuery)
+
+    data_with_vecs = await tbl.to_arrow()
+    data_with_vecs = data_with_vecs.replace_schema_metadata(None)
+    tbl2 = await mem_db_async.create_table("test2", data_with_vecs)
+    with pytest.raises(
+        Exception,
+        match=(
+            "Cannot perform full text search unless an INVERTED index has "
+            "been created"
+        ),
+    ):
+        query = await tbl2.search("0.1").to_arrow()
+
+
+@pytest.mark.asyncio
+async def test_query_search_specified(mem_db_async: AsyncConnection):
+    nrows, ndims = 1000, 16
+    data = pa.table(
+        {
+            "text": [str(i) for i in range(nrows)],
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pc.random(nrows * ndims).cast(pa.float32()), ndims
+            ),
+        }
+    )
+    table = await mem_db_async.create_table("test", data)
+    await table.create_index("text", config=FTS())
+
+    # Validate that specifying fts, vector or hybrid gets the right query.
+    q = [0.1] * ndims
+    query = await table.search(q, query_type="vector")._resolve()
+    assert isinstance(query, AsyncVectorQuery)
+
+    query = await table.search("0.1", query_type="fts")._resolve()
+    assert isinstance(query, AsyncFTSQuery)
+
+    with pytest.raises(
+        ValueError, match="Column 'vector' has no registered embedding function"
+    ) as e:
+        await table.search(q, query_type="hybrid")._resolve()
+
+    assert "No embedding functions are registered for any columns" in exception_output(
+        e
+    )
